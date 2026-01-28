@@ -45,6 +45,10 @@ ALERT_TO_RAW = os.environ.get(
     "wannamine@naver.com,gt.min@hwaseon.com,jhj970826@naver.com"
 )
 ALERT_TO = [x.strip() for x in ALERT_TO_RAW.split(",") if x.strip()]
+
+SNAPSHOT_TO_RAW = os.environ.get("SNAPSHOT_TO", "gt.min@hwaseon.com")
+SNAPSHOT_TO = [x.strip() for x in SNAPSHOT_TO_RAW.split(",") if x.strip()]
+
 # =================================================
 
 # ---------- 사이트 셀렉터 ----------
@@ -317,6 +321,19 @@ def run_once():
             print(f"ISSUE mail sent | issue={len(changes)} | collected={len(cur_df)} | {checked_at}")
         else:
             print(f"no change | collected={len(cur_df)} | {checked_at}")
+
+        # ✅ 항상 스냅샷 메일 발송 (매 실행마다)
+        snapshot_subject = f"<현재가격 스냅샷> {checked_at} (collected={len(cur_df)})"
+        snapshot_body = f"""
+        <p><b>현재 가격 스냅샷</b></p>
+        <p>시간: <b>{checked_at}</b></p>
+        <p>수집: 중복 제외 <b>{len(cur_df)}</b>개</p>
+        <p>첨부파일: <b>catalog_snapshot.xlsx</b></p>
+        """
+
+        send_email(SNAPSHOT_TO, snapshot_subject, snapshot_body, attachments=[SNAPSHOT_PATH])
+        print(f"snapshot mail sent | to={','.join(SNAPSHOT_TO)} | collected={len(cur_df)} | {checked_at}")
+
 
     finally:
         if driver is not None:
