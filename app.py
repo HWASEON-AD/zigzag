@@ -298,7 +298,6 @@ def build_driver():
 def run_once():
     checked_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     driver = None
-    attach_path = None
 
     try:
         driver = build_driver()
@@ -311,29 +310,24 @@ def run_once():
         prev_df = load_prev_snapshot(SNAPSHOT_PATH)
         changes = detect_changes(prev_df, cur_df)
 
+        # 스냅샷은 항상 저장(다음 비교를 위해)
         save_snapshot(cur_df, SNAPSHOT_PATH)
 
+        # ✅ 1) 매번 "스냅샷 메일" 발송 (크롤 될 때마다)
+        subject = f"<스냅샷> {checked_at} (collected={len(cur_df)})"
+        body = build_normal_email_body(cur_df, checked_at)
+        send_email(ALERT_TO, subject, body)
+        print(f"📨 snapshot mail sent | collected={len(cur_df)} | {checked_at}")
+
+        # ✅ 2) 변동이 있으면 "변동 메일"도 추가로 발송 + 엑셀첨부
         if changes:
-            subject = f"<가격변동 확인필요> {checked_at} ({len(changes)}건)"
-            body = build_issue_email_body(changes, checked_at)
+            issue_subject = f"<가격변동 확인필요> {checked_at} ({len(changes)}건)"
+            issue_body = build_issue_email_body(changes, checked_at)
             attach_path = save_changes_excel(changes, checked_at)
-            send_email(ALERT_TO, subject, body, attachments=[attach_path])
-            print(f"ISSUE mail sent | issue={len(changes)} | collected={len(cur_df)} | {checked_at}")
+            send_email(ALERT_TO, issue_subject, issue_body, attachments=[attach_path])
+            print(f"📨 ISSUE mail sent | issue={len(changes)} | collected={len(cur_df)} | {checked_at}")
         else:
-            print(f"no change | collected={len(cur_df)} | {checked_at}")
-
-        # ✅ 항상 스냅샷 메일 발송 (매 실행마다)
-        snapshot_subject = f"<현재가격 스냅샷> {checked_at} (collected={len(cur_df)})"
-        snapshot_body = f"""
-        <p><b>현재 가격 스냅샷</b></p>
-        <p>시간: <b>{checked_at}</b></p>
-        <p>수집: 중복 제외 <b>{len(cur_df)}</b>개</p>
-        <p>첨부파일: <b>catalog_snapshot.xlsx</b></p>
-        """
-
-        send_email(SNAPSHOT_TO, snapshot_subject, snapshot_body, attachments=[SNAPSHOT_PATH])
-        print(f"snapshot mail sent | to={','.join(SNAPSHOT_TO)} | collected={len(cur_df)} | {checked_at}")
-
+            print(f"✅ no change | collected={len(cur_df)} | {checked_at}")
 
     finally:
         if driver is not None:
