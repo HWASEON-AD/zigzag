@@ -335,6 +335,35 @@ def run_once():
                 driver.quit()
             except Exception:
                 pass
+def build_normal_email_body(cur_df: pd.DataFrame, checked_at: str) -> str:
+    df = cur_df.copy()
+    if EMAIL_SHOW_LIMIT is not None and len(df) > EMAIL_SHOW_LIMIT:
+        df = df.iloc[:EMAIL_SHOW_LIMIT].copy()
+
+    rows_html = ""
+    for _, r in df.iterrows():
+        rows_html += f"""
+        <tr>
+          <td>{r.get("rank","")}</td>
+          <td>{(r.get("product_name") or "")}</td>
+          <td>{(r.get("discount") or "")}</td>
+          <td>{(r.get("price") or "")}</td>
+          <td><a href="{r.get("href","")}" target="_blank">open</a></td>
+        </tr>
+        """
+
+    return f"""
+    <p><b>현재 가격 스냅샷</b></p>
+    <p>시간: <b>{checked_at}</b></p>
+    <p>수집: 중복 제외 <b>{len(cur_df)}</b>개 (목표 {TARGET_UNIQUE}개)</p>
+
+    <table border="1" cellpadding="6" cellspacing="0" style="border-collapse:collapse; font-size:13px;">
+      <thead>
+        <tr><th>Rank</th><th>Product</th><th>Discount</th><th>Price</th><th>Link</th></tr>
+      </thead>
+      <tbody>{rows_html}</tbody>
+    </table>
+    """
 
 
 def main_loop():
