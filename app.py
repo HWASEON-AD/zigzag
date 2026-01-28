@@ -4,6 +4,7 @@ import traceback
 import pandas as pd
 import smtplib
 from datetime import datetime
+from glob import glob
 
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
@@ -18,7 +19,7 @@ from selenium.common.exceptions import StaleElementReferenceException, TimeoutEx
 from selenium.webdriver.support.ui import WebDriverWait
 
 
-# ===================== 설정 =====================
+# ===================== ENV 설정 =====================
 URL = os.environ.get(
     "TARGET_URL",
     "https://zigzag.kr/search?keyword=%EC%9B%8C%EB%84%88%EB%A7%88%EC%9D%B8"
@@ -28,11 +29,16 @@ TARGET_UNIQUE = int(os.environ.get("TARGET_UNIQUE", "500"))
 SCROLL_WAIT = int(os.environ.get("SCROLL_WAIT", "5"))
 MAX_SCROLLS = int(os.environ.get("MAX_SCROLLS", "250"))
 STAGNANT_LIMIT = int(os.environ.get("STAGNANT_LIMIT", "50"))
-EMAIL_SHOW_LIMIT = int(os.environ.get("EMAIL_SHOW_LIMIT", "500"))
 
-# Render: 퍼시스턴트 디스크 쓰면 /var/data 권장 (DATA_DIR로 주입)
+# ✅ 매번 전체를 첨부로 보내므로 본문 표 출력은 기본 OFF(0이면 표 미포함)
+EMAIL_SHOW_LIMIT = int(os.environ.get("EMAIL_SHOW_LIMIT", "0"))
+
+# ✅ 스냅샷 파일 누적 저장 개수(최근 N개만 유지)
+KEEP_SNAPSHOT_FILES = int(os.environ.get("KEEP_SNAPSHOT_FILES", "48"))  # 48개=2일치(1시간마다 기준)
+
+# Render Persistent Disk 경로 권장: /var/data
 BASE_DIR = os.environ.get("DATA_DIR", "/tmp")
-SNAPSHOT_PATH = os.path.join(BASE_DIR, "catalog_snapshot.xlsx")
+SNAPSHOT_PATH = os.path.join(BASE_DIR, "catalog_snapshot.xlsx")  # 비교용 "최신 1개"
 CHANGE_DIR = os.path.join(BASE_DIR, "price_changes")
 os.makedirs(CHANGE_DIR, exist_ok=True)
 
@@ -46,7 +52,7 @@ ALERT_TO_RAW = os.environ.get(
     "wannamine@naver.com,gt.min@hwaseon.com,jhj970826@naver.com"
 )
 ALERT_TO = [x.strip() for x in ALERT_TO_RAW.split(",") if x.strip()]
-# ===============================================
+# ====================================================
 
 
 # ---------- 사이트 셀렉터 ----------
@@ -182,7 +188,6 @@ def scrape_ranked(driver, target_unique=TARGET_UNIQUE) -> pd.DataFrame:
         if len(items) >= target_unique:
             break
 
-        # ✅ 여기서만 대기(중복 대기 제거)
         page_down(driver, n=1)
         scrolls += 1
 
@@ -198,11 +203,42 @@ def load_prev_snapshot(path=SNAPSHOT_PATH):
     return None
 
 
-def save_snapshot(df: pd.DataFrame, path=SNAPSHOT_PATH):
+def save_snapshot_latest(df: pd.DataFrame, path=SNAPSHOT_PATH):
+    """비교 기준용: catalog_snapshot.xlsx (항상 1개 덮어쓰기)"""
     df.to_excel(path, index=False)
 
 
+def save_snapshot_copy_excel(df: pd.DataFrame, checked_at_str: str) -> str:
+    """운영 로그용: 실행마다 스냅샷 파일을 남김 (메일 첨부용)"""
+    ts = checked_at_str.replace("-", "").replace(":", "").replace(" ", "_")
+    path = os.path.join(BASE_DIR, f"snapshot_{ts}.xlsx")
+    df.to_excel(path, index=False)
+    return path
+
+
+def cleanup_old_snapshots(keep_n: int = KEEP_SNAPSHOT_FILES):
+    """snapshot_*.xlsx 오래된 것 삭제 (최근 N개만 유지)"""
+    try:
+        files = sorted(glob(os.path.join(BASE_DIR, "snapshot_*.xlsx")))
+        if keep_n <= 0:
+            return
+        if len(files) <= keep_n:
+            return
+        to_delete = files[:len(files) - keep_n]
+        for f in to_delete:
+            try:
+                os.remove(f)
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+
 def detect_changes(prev_df: pd.DataFrame, cur_df: pd.DataFrame):
+    """
+    href 동일 = 동일상품
+    discount 또는 price 텍스트 변경이면 변화로 판단
+    """
     if prev_df is None or prev_df.empty or cur_df is None or cur_df.empty:
         return []
 
@@ -264,37 +300,6 @@ def build_issue_email_body(changes, checked_at: str) -> str:
     """
 
 
-def build_normal_email_body(cur_df: pd.DataFrame, checked_at: str) -> str:
-    df = cur_df.copy()
-    if EMAIL_SHOW_LIMIT is not None and len(df) > EMAIL_SHOW_LIMIT:
-        df = df.iloc[:EMAIL_SHOW_LIMIT].copy()
-
-    rows_html = ""
-    for _, r in df.iterrows():
-        rows_html += f"""
-        <tr>
-          <td>{r.get("rank","")}</td>
-          <td>{(r.get("product_name") or "")}</td>
-          <td>{(r.get("discount") or "")}</td>
-          <td>{(r.get("price") or "")}</td>
-          <td><a href="{r.get("href","")}" target="_blank">open</a></td>
-        </tr>
-        """
-
-    return f"""
-    <p><b>현재 가격 스냅샷</b></p>
-    <p>시간: <b>{checked_at}</b></p>
-    <p>수집: 중복 제외 <b>{len(cur_df)}</b>개 (목표 {TARGET_UNIQUE}개)</p>
-
-    <table border="1" cellpadding="6" cellspacing="0" style="border-collapse:collapse; font-size:13px;">
-      <thead>
-        <tr><th>Rank</th><th>Product</th><th>Discount</th><th>Price</th><th>Link</th></tr>
-      </thead>
-      <tbody>{rows_html}</tbody>
-    </table>
-    """
-
-
 def save_changes_excel(changes, checked_at_str: str) -> str:
     ts = checked_at_str.replace("-", "").replace(":", "").replace(" ", "_")
     path = os.path.join(CHANGE_DIR, f"price_change_{ts}.xlsx")
@@ -327,7 +332,6 @@ def build_driver():
 def run_once():
     checked_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     driver = None
-    attach_path = None
 
     try:
         driver = build_driver()
@@ -337,25 +341,37 @@ def run_once():
         time.sleep(5)
 
         cur_df = scrape_ranked(driver, target_unique=TARGET_UNIQUE)
+
         prev_df = load_prev_snapshot(SNAPSHOT_PATH)
         changes = detect_changes(prev_df, cur_df)
 
-        # 항상 스냅샷 저장
-        save_snapshot(cur_df, SNAPSHOT_PATH)
+        # 1) 비교 기준용 최신 스냅샷 덮어쓰기
+        save_snapshot_latest(cur_df, SNAPSHOT_PATH)
 
-        # ✅ 매 실행마다 스냅샷 메일 발송
+        # 2) 실행마다 스냅샷 파일 생성(메일 첨부용)
+        snapshot_path = save_snapshot_copy_excel(cur_df, checked_at)
+
+        # 3) 오래된 스냅샷 정리
+        cleanup_old_snapshots(KEEP_SNAPSHOT_FILES)
+
+        # ✅ 매 실행마다 "전체 스냅샷 엑셀"을 첨부해서 메일 발송
         subject = f"<스냅샷> {checked_at} (collected={len(cur_df)})"
-        body = build_normal_email_body(cur_df, checked_at)
-        send_email(ALERT_TO, subject, body)
-        print(f"snapshot mail sent | collected={len(cur_df)} | {checked_at}")
+        body = f"""
+        <p><b>스냅샷 완료</b></p>
+        <p>시간: <b>{checked_at}</b></p>
+        <p>수집: <b>{len(cur_df)}</b>개 (목표 {TARGET_UNIQUE})</p>
+        <p>첨부: <b>전체 스냅샷 엑셀</b></p>
+        """
+        send_email(ALERT_TO, subject, body, attachments=[snapshot_path])
+        print(f"snapshot mail sent | collected={len(cur_df)} | {checked_at} | attach={os.path.basename(snapshot_path)}")
 
         # ✅ 변동 있으면 변동 메일 + 엑셀 첨부(추가 발송)
         if changes:
             issue_subject = f"<가격변동 확인필요> {checked_at} ({len(changes)}건)"
             issue_body = build_issue_email_body(changes, checked_at)
-            attach_path = save_changes_excel(changes, checked_at)
-            send_email(ALERT_TO, issue_subject, issue_body, attachments=[attach_path])
-            print(f"ISSUE mail sent | issue={len(changes)} | collected={len(cur_df)} | {checked_at}")
+            change_path = save_changes_excel(changes, checked_at)
+            send_email(ALERT_TO, issue_subject, issue_body, attachments=[change_path])
+            print(f"ISSUE mail sent | issue={len(changes)} | {checked_at} | attach={os.path.basename(change_path)}")
         else:
             print(f"no change | collected={len(cur_df)} | {checked_at}")
 
