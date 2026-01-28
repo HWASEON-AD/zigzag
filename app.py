@@ -33,8 +33,11 @@ STAGNANT_LIMIT = int(os.environ.get("STAGNANT_LIMIT", "50"))
 # ✅ 스냅샷 파일 누적 저장 개수(최근 N개만 유지)
 KEEP_SNAPSHOT_FILES = int(os.environ.get("KEEP_SNAPSHOT_FILES", "48"))
 
-# Render Persistent Disk 경로 권장: /var/data
-BASE_DIR = os.environ.get("DATA_DIR", "/tmp")
+# ✅ Render Persistent Disk 경로 권장: /var/data
+#    (기본값을 /tmp로 두면 재시작/배포 때 prev 스냅샷이 날아가서 "변동 없음"이 계속 뜰 수 있음)
+BASE_DIR = os.environ.get("DATA_DIR", "/var/data")
+os.makedirs(BASE_DIR, exist_ok=True)
+
 SNAPSHOT_PATH = os.path.join(BASE_DIR, "catalog_snapshot.xlsx")  # 비교 기준(항상 1개 덮어쓰기)
 CHANGE_DIR = os.path.join(BASE_DIR, "price_changes")
 os.makedirs(CHANGE_DIR, exist_ok=True)
@@ -137,6 +140,14 @@ def page_down(driver, n=1):
         time.sleep(SCROLL_WAIT)
 
 
+def to_int_digits(s: str):
+    """'12,900원' -> 12900 / '20%' -> 20 / '' -> None"""
+    if s is None:
+        return None
+    digits = "".join(ch for ch in str(s) if ch.isdigit())
+    return int(digits) if digits else None
+
+
 def scrape_ranked(driver, target_unique=TARGET_UNIQUE) -> pd.DataFrame:
     try:
         wait_for_links(driver, timeout=20)
@@ -175,6 +186,9 @@ def scrape_ranked(driver, target_unique=TARGET_UNIQUE) -> pd.DataFrame:
                     "product_name": name,
                     "discount": discount,
                     "price": price,
+                    # 정규화(비교 안정화)
+                    "discount_int": to_int_digits(discount),
+                    "price_int": to_int_digits(price),
                 })
                 seen.add(href)
 
@@ -232,30 +246,60 @@ def cleanup_old_snapshots(keep_n: int = KEEP_SNAPSHOT_FILES):
 
 
 def detect_changes(prev_df: pd.DataFrame, cur_df: pd.DataFrame):
+    """
+    비교 기준:
+    - href 동일한 상품에 대해 discount_int / price_int가 바뀌면 변동으로 판단
+    - 정규화 int가 None이면(raw 문자열로 fallback)
+    """
     if prev_df is None or prev_df.empty or cur_df is None or cur_df.empty:
         return []
 
-    prev = prev_df[["href", "rank", "discount", "price"]].copy()
-    cur = cur_df[["href", "rank", "discount", "price"]].copy()
+    # 이전 버전 스냅샷에 int 컬럼이 없을 수도 있으니 보정
+    prev = prev_df.copy()
+    cur = cur_df.copy()
+
+    if "discount_int" not in prev.columns and "discount" in prev.columns:
+        prev["discount_int"] = prev["discount"].apply(to_int_digits)
+    if "price_int" not in prev.columns and "price" in prev.columns:
+        prev["price_int"] = prev["price"].apply(to_int_digits)
+
+    needed_cols_prev = [c for c in ["href", "rank", "discount", "price", "discount_int", "price_int"] if c in prev.columns]
+    needed_cols_cur = [c for c in ["href", "rank", "discount", "price", "discount_int", "price_int"] if c in cur.columns]
+
+    prev = prev[needed_cols_prev].copy()
+    cur = cur[needed_cols_cur].copy()
 
     merged = prev.merge(cur, on="href", how="inner", suffixes=("_prev", "_cur"))
 
     changes = []
     for _, r in merged.iterrows():
-        disc_prev = (r.get("discount_prev") or "").strip()
-        disc_cur = (r.get("discount_cur") or "").strip()
-        price_prev = (r.get("price_prev") or "").strip()
-        price_cur = (r.get("price_cur") or "").strip()
+        disc_prev_raw = (r.get("discount_prev") or "").strip()
+        disc_cur_raw = (r.get("discount_cur") or "").strip()
+        price_prev_raw = (r.get("price_prev") or "").strip()
+        price_cur_raw = (r.get("price_cur") or "").strip()
 
-        if disc_prev != disc_cur or price_prev != price_cur:
+        disc_prev_int = r.get("discount_int_prev", None)
+        disc_cur_int = r.get("discount_int_cur", None)
+        price_prev_int = r.get("price_int_prev", None)
+        price_cur_int = r.get("price_int_cur", None)
+
+        # int 값이 둘 다 있으면 int로 비교, 아니면 raw 문자열 비교
+        disc_changed = (disc_prev_int != disc_cur_int) if (disc_prev_int is not None and disc_cur_int is not None) else (disc_prev_raw != disc_cur_raw)
+        price_changed = (price_prev_int != price_cur_int) if (price_prev_int is not None and price_cur_int is not None) else (price_prev_raw != price_cur_raw)
+
+        if disc_changed or price_changed:
             changes.append({
                 "href": r["href"],
                 "rank_prev": r.get("rank_prev", ""),
                 "rank_cur": r.get("rank_cur", ""),
-                "discount_prev": disc_prev,
-                "discount_cur": disc_cur,
-                "price_prev": price_prev,
-                "price_cur": price_cur,
+                "discount_prev": disc_prev_raw,
+                "discount_cur": disc_cur_raw,
+                "price_prev": price_prev_raw,
+                "price_cur": price_cur_raw,
+                "discount_prev_int": disc_prev_int,
+                "discount_cur_int": disc_cur_int,
+                "price_prev_int": price_prev_int,
+                "price_cur_int": price_cur_int,
             })
     return changes
 
@@ -298,7 +342,14 @@ def save_changes_excel(changes, checked_at_str: str) -> str:
     path = os.path.join(CHANGE_DIR, f"price_change_{ts}.xlsx")
 
     df = pd.DataFrame(changes)
-    cols = ["href", "rank_prev", "rank_cur", "discount_prev", "discount_cur", "price_prev", "price_cur"]
+    cols = [
+        "href",
+        "rank_prev", "rank_cur",
+        "discount_prev", "discount_cur",
+        "price_prev", "price_cur",
+        "discount_prev_int", "discount_cur_int",
+        "price_prev_int", "price_cur_int",
+    ]
     df = df[[c for c in cols if c in df.columns]]
     df.to_excel(path, index=False)
     return path
@@ -326,6 +377,10 @@ def run_once():
     driver = None
 
     try:
+        # ---- prev 스냅샷 존재 여부 로그 (변동 안 오는 1순위 원인 확인용) ----
+        print(f"[CONFIG] BASE_DIR={BASE_DIR}")
+        print(f"[CONFIG] SNAPSHOT_PATH={SNAPSHOT_PATH} exists={os.path.exists(SNAPSHOT_PATH)}")
+
         driver = build_driver()
         driver.get(URL)
         time.sleep(2)
@@ -335,9 +390,13 @@ def run_once():
         cur_df = scrape_ranked(driver, target_unique=TARGET_UNIQUE)
 
         prev_df = load_prev_snapshot(SNAPSHOT_PATH)
-        changes = detect_changes(prev_df, cur_df)
+        print(f"[PREV] loaded={'YES' if (prev_df is not None and not prev_df.empty) else 'NO'} rows={0 if prev_df is None else len(prev_df)}")
+        print(f"[CUR] rows={len(cur_df)}")
 
-        # 비교 기준용 최신 스냅샷 덮어쓰기
+        changes = detect_changes(prev_df, cur_df)
+        print(f"[DIFF] changes={len(changes)}")
+
+        # 비교 기준용 최신 스냅샷 덮어쓰기 (다음 실행에서 prev로 사용)
         save_snapshot_latest(cur_df, SNAPSHOT_PATH)
 
         # 실행마다 스냅샷 파일 생성(메일 첨부용)
@@ -353,6 +412,7 @@ def run_once():
         <p>시간: <b>{checked_at}</b></p>
         <p>수집: <b>{len(cur_df)}</b>개 (목표 {TARGET_UNIQUE})</p>
         <p>첨부: <b>전체 스냅샷 엑셀</b></p>
+        <p>SNAPSHOT_PATH 유지 여부: <b>{'YES' if os.path.exists(SNAPSHOT_PATH) else 'NO'}</b></p>
         """
         send_email(SNAPSHOT_TO, subject, body, attachments=[snapshot_path])
         print(f"snapshot mail sent | to={','.join(SNAPSHOT_TO)} | collected={len(cur_df)} | {checked_at} | attach={os.path.basename(snapshot_path)}")
