@@ -14,12 +14,15 @@ from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.common.by import By
-from selenium.webdriver.common.keys import Keys
 from selenium.common.exceptions import StaleElementReferenceException, TimeoutException
 from selenium.webdriver.support.ui import WebDriverWait
 
+
 # ===================== 설정 =====================
-URL = os.environ.get("TARGET_URL", "https://zigzag.kr/search?keyword=%EC%9B%8C%EB%84%88%EB%A7%88%EC%9D%B8")
+URL = os.environ.get(
+    "TARGET_URL",
+    "https://zigzag.kr/search?keyword=%EC%9B%8C%EB%84%88%EB%A7%88%EC%9D%B8"
+)
 
 TARGET_UNIQUE = int(os.environ.get("TARGET_UNIQUE", "500"))
 SCROLL_WAIT = int(os.environ.get("SCROLL_WAIT", "5"))
@@ -27,9 +30,7 @@ MAX_SCROLLS = int(os.environ.get("MAX_SCROLLS", "250"))
 STAGNANT_LIMIT = int(os.environ.get("STAGNANT_LIMIT", "50"))
 EMAIL_SHOW_LIMIT = int(os.environ.get("EMAIL_SHOW_LIMIT", "500"))
 
-INTERVAL_SECONDS = int(os.environ.get("INTERVAL_SECONDS", str(60 * 60)))  # 1시간
-
-# Render에서는 Desktop 없음. 기본 /tmp(휘발성), 퍼시스턴트 디스크 쓰면 /var/data 권장
+# Render: 퍼시스턴트 디스크 쓰면 /var/data 권장 (DATA_DIR로 주입)
 BASE_DIR = os.environ.get("DATA_DIR", "/tmp")
 SNAPSHOT_PATH = os.path.join(BASE_DIR, "catalog_snapshot.xlsx")
 CHANGE_DIR = os.path.join(BASE_DIR, "price_changes")
@@ -38,18 +39,15 @@ os.makedirs(CHANGE_DIR, exist_ok=True)
 SMTP_SERVER = os.environ.get("SMTP_SERVER", "smtp.worksmobile.com")
 PORT = int(os.environ.get("SMTP_PORT", "465"))
 USER = os.environ.get("SMTP_USER", "gt.min@hwaseon.com")
-PASSWORD = os.environ.get("SMTP_PASSWORD", "")  # Render Env로 넣을 것
+PASSWORD = os.environ.get("SMTP_PASSWORD", "")
 
 ALERT_TO_RAW = os.environ.get(
     "ALERT_TO",
     "wannamine@naver.com,gt.min@hwaseon.com,jhj970826@naver.com"
 )
 ALERT_TO = [x.strip() for x in ALERT_TO_RAW.split(",") if x.strip()]
+# ===============================================
 
-SNAPSHOT_TO_RAW = os.environ.get("SNAPSHOT_TO", "gt.min@hwaseon.com")
-SNAPSHOT_TO = [x.strip() for x in SNAPSHOT_TO_RAW.split(",") if x.strip()]
-
-# =================================================
 
 # ---------- 사이트 셀렉터 ----------
 LINK_SEL = "a.css-1pjr9xx.product-card-link"
@@ -64,7 +62,7 @@ def send_email(to_emails, subject: str, body_html: str, attachments=None):
         attachments = []
 
     if not PASSWORD:
-        raise RuntimeError("SMTP_PASSWORD가 비어있습니다. Render의 Environment Variables에 SMTP_PASSWORD를 설정하세요.")
+        raise RuntimeError("SMTP_PASSWORD가 비어있습니다. Render Environment Variables에 SMTP_PASSWORD를 설정하세요.")
 
     msg = MIMEMultipart()
     msg["Subject"] = subject
@@ -184,8 +182,8 @@ def scrape_ranked(driver, target_unique=TARGET_UNIQUE) -> pd.DataFrame:
         if len(items) >= target_unique:
             break
 
+        # ✅ 여기서만 대기(중복 대기 제거)
         page_down(driver, n=1)
-        time.sleep(SCROLL_WAIT)
         scrolls += 1
 
     return pd.DataFrame(items)
@@ -266,75 +264,6 @@ def build_issue_email_body(changes, checked_at: str) -> str:
     """
 
 
-def save_changes_excel(changes, checked_at_str: str) -> str:
-    ts = checked_at_str.replace("-", "").replace(":", "").replace(" ", "_")
-    path = os.path.join(CHANGE_DIR, f"price_change_{ts}.xlsx")
-
-    df = pd.DataFrame(changes)
-    cols = ["href", "rank_prev", "rank_cur", "discount_prev", "discount_cur", "price_prev", "price_cur"]
-    df = df[[c for c in cols if c in df.columns]]
-    df.to_excel(path, index=False)
-    return path
-
-
-def build_driver():
-    options = Options()
-    options.add_argument("--headless=new")
-    options.add_argument("--disable-gpu")
-    options.add_argument("--no-sandbox")
-    options.add_argument("--disable-dev-shm-usage")
-    options.add_argument("--window-size=1200,900")
-    options.add_argument("--disable-blink-features=AutomationControlled")
-
-    # Dockerfile에서 설치한 chromium/chromedriver 경로 고정
-    options.binary_location = "/usr/bin/chromium"
-    service = Service("/usr/bin/chromedriver")
-
-    driver = webdriver.Chrome(service=service, options=options)
-    driver.set_page_load_timeout(60)
-    return driver
-
-
-def run_once():
-    checked_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    driver = None
-
-    try:
-        driver = build_driver()
-        driver.get(URL)
-        time.sleep(2)
-        driver.refresh()
-        time.sleep(5)
-
-        cur_df = scrape_ranked(driver, target_unique=TARGET_UNIQUE)
-        prev_df = load_prev_snapshot(SNAPSHOT_PATH)
-        changes = detect_changes(prev_df, cur_df)
-
-        # 스냅샷은 항상 저장(다음 비교를 위해)
-        save_snapshot(cur_df, SNAPSHOT_PATH)
-
-        # ✅ 1) 매번 "스냅샷 메일" 발송 (크롤 될 때마다)
-        subject = f"<스냅샷> {checked_at} (collected={len(cur_df)})"
-        body = build_normal_email_body(cur_df, checked_at)
-        send_email(ALERT_TO, subject, body)
-        print(f"📨 snapshot mail sent | collected={len(cur_df)} | {checked_at}")
-
-        # ✅ 2) 변동이 있으면 "변동 메일"도 추가로 발송 + 엑셀첨부
-        if changes:
-            issue_subject = f"<가격변동 확인필요> {checked_at} ({len(changes)}건)"
-            issue_body = build_issue_email_body(changes, checked_at)
-            attach_path = save_changes_excel(changes, checked_at)
-            send_email(ALERT_TO, issue_subject, issue_body, attachments=[attach_path])
-            print(f"📨 ISSUE mail sent | issue={len(changes)} | collected={len(cur_df)} | {checked_at}")
-        else:
-            print(f"✅ no change | collected={len(cur_df)} | {checked_at}")
-
-    finally:
-        if driver is not None:
-            try:
-                driver.quit()
-            except Exception:
-                pass
 def build_normal_email_body(cur_df: pd.DataFrame, checked_at: str) -> str:
     df = cur_df.copy()
     if EMAIL_SHOW_LIMIT is not None and len(df) > EMAIL_SHOW_LIMIT:
@@ -366,29 +295,93 @@ def build_normal_email_body(cur_df: pd.DataFrame, checked_at: str) -> str:
     """
 
 
-def main_loop():
-    while True:
-        start = time.time()
+def save_changes_excel(changes, checked_at_str: str) -> str:
+    ts = checked_at_str.replace("-", "").replace(":", "").replace(" ", "_")
+    path = os.path.join(CHANGE_DIR, f"price_change_{ts}.xlsx")
+
+    df = pd.DataFrame(changes)
+    cols = ["href", "rank_prev", "rank_cur", "discount_prev", "discount_cur", "price_prev", "price_cur"]
+    df = df[[c for c in cols if c in df.columns]]
+    df.to_excel(path, index=False)
+    return path
+
+
+def build_driver():
+    options = Options()
+    options.add_argument("--headless=new")
+    options.add_argument("--disable-gpu")
+    options.add_argument("--no-sandbox")
+    options.add_argument("--disable-dev-shm-usage")
+    options.add_argument("--window-size=1200,900")
+    options.add_argument("--disable-blink-features=AutomationControlled")
+
+    # Dockerfile에서 설치한 chromium/chromedriver 경로
+    options.binary_location = "/usr/bin/chromium"
+    service = Service("/usr/bin/chromedriver")
+
+    driver = webdriver.Chrome(service=service, options=options)
+    driver.set_page_load_timeout(60)
+    return driver
+
+
+def run_once():
+    checked_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    driver = None
+    attach_path = None
+
+    try:
+        driver = build_driver()
+        driver.get(URL)
+        time.sleep(2)
+        driver.refresh()
+        time.sleep(5)
+
+        cur_df = scrape_ranked(driver, target_unique=TARGET_UNIQUE)
+        prev_df = load_prev_snapshot(SNAPSHOT_PATH)
+        changes = detect_changes(prev_df, cur_df)
+
+        # 항상 스냅샷 저장
+        save_snapshot(cur_df, SNAPSHOT_PATH)
+
+        # ✅ 매 실행마다 스냅샷 메일 발송
+        subject = f"<스냅샷> {checked_at} (collected={len(cur_df)})"
+        body = build_normal_email_body(cur_df, checked_at)
+        send_email(ALERT_TO, subject, body)
+        print(f"snapshot mail sent | collected={len(cur_df)} | {checked_at}")
+
+        # ✅ 변동 있으면 변동 메일 + 엑셀 첨부(추가 발송)
+        if changes:
+            issue_subject = f"<가격변동 확인필요> {checked_at} ({len(changes)}건)"
+            issue_body = build_issue_email_body(changes, checked_at)
+            attach_path = save_changes_excel(changes, checked_at)
+            send_email(ALERT_TO, issue_subject, issue_body, attachments=[attach_path])
+            print(f"ISSUE mail sent | issue={len(changes)} | collected={len(cur_df)} | {checked_at}")
+        else:
+            print(f"no change | collected={len(cur_df)} | {checked_at}")
+
+    except Exception as e:
+        err = traceback.format_exc()
+        print(err)
+
+        # 에러 메일
         try:
-            run_once()
-        except Exception as e:
-            err = traceback.format_exc()
-            print(f"run error: {e}\n{err}")
+            subject = f"<크롤러 에러> {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+            body = f"""
+            <p><b>크롤러 실행 중 에러 발생</b></p>
+            <pre style="white-space:pre-wrap; font-size:12px;">{err}</pre>
+            """
+            send_email(ALERT_TO, subject, body)
+        except Exception as mail_e:
+            print(f"error-mail failed: {mail_e}")
 
-            # 에러도 메일로 보내고 싶다면 유지
+        raise e
+
+    finally:
+        if driver is not None:
             try:
-                subject = f"<크롤러 에러> {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
-                body = f"""
-                <p><b>크롤러 실행 중 에러 발생</b></p>
-                <pre style="white-space:pre-wrap; font-size:12px;">{err}</pre>
-                """
-                send_email(ALERT_TO, subject, body)
-            except Exception as mail_e:
-                print(f"error-mail failed: {mail_e}")
-
-        elapsed = time.time() - start
-        sleep_for = max(0, INTERVAL_SECONDS - elapsed)
-        time.sleep(sleep_for)
+                driver.quit()
+            except Exception:
+                pass
 
 
 if __name__ == "__main__":
